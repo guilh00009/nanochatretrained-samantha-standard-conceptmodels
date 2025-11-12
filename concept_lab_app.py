@@ -8,7 +8,8 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from contextlib import contextmanager
+from typing import Dict, List, Optional, Tuple, Generator
 
 import gradio as gr
 import matplotlib
@@ -141,6 +142,21 @@ SIMPLE_PROMPT_TEMPLATES = [
 ]
 
 MODEL_LOCK = threading.Lock()
+
+
+class ModelBusyError(RuntimeError):
+    """Raised when the model is already processing another request."""
+
+
+@contextmanager
+def model_session():
+    acquired = MODEL_LOCK.acquire(blocking=False)
+    if not acquired:
+        raise ModelBusyError("model is busy")
+    try:
+        yield
+    finally:
+        MODEL_LOCK.release()
 
 _MODEL: Optional[NanochatModel] = None
 _MAPPER: Optional["ConceptMapper"] = None
@@ -472,14 +488,37 @@ def get_injector() -> ConceptInjector:
 repository = ConceptRepository(CONCEPT_DIR)
 
 
+def ensure_history_list(history: Optional[List[dict]]) -> List[dict]:
+    if history is None:
+        return []
+    return list(history)
+
+
+def history_to_pairs(history: List[dict]) -> List[tuple[str, str]]:
+    pairs: List[tuple[str, str]] = []
+    i = 0
+    n = len(history)
+    while i < n:
+        msg = history[i]
+        if msg.get("role") == "user":
+            user_text = msg.get("content") or ""
+            assistant_text = ""
+            if i + 1 < n and history[i + 1].get("role") == "assistant":
+                assistant_text = history[i + 1].get("content") or ""
+                i += 1
+            pairs.append((user_text, assistant_text))
+        i += 1
+    return pairs
+
+
 def concept_table_rows() -> List[List[str]]:
     return repository.table_rows()
 
 
-def dropdown_update(current_value: Optional[str]) -> gr.Dropdown:
+def dropdown_update(current_value: Optional[str]) -> dict:
     choices = repository.list_concepts()
     value = current_value if current_value in choices else None
-    return gr.Dropdown.update(choices=choices, value=value)
+    return gr.update(choices=choices, value=value)
 
 
 def map_random_concepts(
@@ -487,22 +526,34 @@ def map_random_concepts(
     prompt_variations: int,
     seed_text: str,
     current_concept: Optional[str],
-) -> tuple[str, List[List[str]], Optional[Image.Image], gr.Dropdown]:
+) -> tuple[str, List[List[str]], Optional[Image.Image], dict]:
     seed = parse_seed(seed_text)
     words = sample_words(limit, seed)
     mapper = get_mapper()
     log_lines: List[str] = []
     latest_image: Optional[Image.Image] = None
 
-    with MODEL_LOCK:
-        for word in words:
-            record = mapper.map_concept(word, prompt_variations)
-            repository.upsert(record)
-            latest_image = mapper.render_concept_image(record)
-            peak = record.norms.get(record.highlight_layer, 0.0)
-            log_lines.append(
-                f"{record.concept}: peak layer {record.highlight_layer} (norm {peak:.4f})"
-            )
+    try:
+        with model_session():
+            for word in words:
+                record = mapper.map_concept(word, prompt_variations)
+                repository.upsert(record)
+                latest_image = mapper.render_concept_image(record)
+                peak = record.norms.get(record.highlight_layer, 0.0)
+                log_lines.append(
+                    f"{record.concept}: peak layer {record.highlight_layer} (norm {peak:.4f})"
+                )
+    except ModelBusyError:
+        busy_msg = (
+            "Model is still running another request (chat or mapper). "
+            "Wait for it to finish, then try again."
+        )
+        return (
+            busy_msg,
+            repository.table_rows(),
+            None,
+            dropdown_update(current_concept),
+        )
 
     log_text = "\n".join(log_lines) if log_lines else "No concepts mapped yet."
     rows = repository.table_rows()
@@ -514,7 +565,7 @@ def map_single_concept(
     word: str,
     prompt_variations: int,
     current_concept: Optional[str],
-) -> tuple[str, List[List[str]], Optional[Image.Image], gr.Dropdown]:
+) -> tuple[str, List[List[str]], Optional[Image.Image], dict]:
     clean = " ".join((word or "").strip().split())
     if not clean:
         return (
@@ -525,10 +576,22 @@ def map_single_concept(
         )
 
     mapper = get_mapper()
-    with MODEL_LOCK:
-        record = mapper.map_concept(clean, prompt_variations)
-        repository.upsert(record)
-        image = mapper.render_concept_image(record)
+    try:
+        with model_session():
+            record = mapper.map_concept(clean, prompt_variations)
+            repository.upsert(record)
+            image = mapper.render_concept_image(record)
+    except ModelBusyError:
+        busy_msg = (
+            "Model is still running another request (chat or mapper). "
+            "Wait for it to finish, then try again."
+        )
+        return (
+            busy_msg,
+            repository.table_rows(),
+            None,
+            dropdown_update(current_concept),
+        )
     message = (
         f"Mapped concept '{record.concept}' "
         f"(peak layer {record.highlight_layer}, norm {record.norms.get(record.highlight_layer, 0.0):.4f})."
@@ -538,40 +601,53 @@ def map_single_concept(
     return message, rows, image, dropdown
 
 
-def refresh_concepts(current_concept: Optional[str]) -> tuple[List[List[str]], gr.Dropdown]:
+def refresh_concepts(current_concept: Optional[str]) -> tuple[List[List[str]], dict]:
     return repository.table_rows(), dropdown_update(current_concept)
 
 
-def add_user_message(message: str, history: List[tuple[str, str]]):
+def add_user_message(message: str, history: Optional[List[dict]]) -> Tuple[dict, List[dict]]:
+    history_list = ensure_history_list(history)
     if not message.strip():
-        return gr.update(value=""), history
-    updated = history + [(message, "")]
-    return gr.update(value=""), updated
+        return gr.update(value=""), history_list
+    history_list.append({"role": "user", "content": message})
+    history_list.append({"role": "assistant", "content": ""})
+    return gr.update(value=""), history_list
 
 
 def concept_chat_reply(
-    history: List[tuple[str, str]],
+    history: Optional[List[dict]],
     temperature: float,
     top_k: int,
     system_prompt: str,
     selected_concept: Optional[str],
     inject_concept: bool,
     intensity: float,
-) -> List[tuple[str, str]]:
-    if not history:
-        return history
+) -> Generator[List[dict], None, None]:
+    history_list = ensure_history_list(history)
+    if not history_list:
+        yield history_list
+        return
+    if history_list[-1].get("role") != "assistant":
+        yield history_list
+        return
 
     conversation: List[dict[str, str]] = []
     sys = (system_prompt or "").strip()
     if sys:
         conversation.append({"role": "system", "content": sys})
 
-    for user_msg, bot_msg in history[:-1]:
+    pairs = history_to_pairs(history_list)
+    if not pairs:
+        yield history_list
+        return
+
+    for user_msg, bot_msg in pairs[:-1]:
         conversation.append({"role": "user", "content": user_msg})
         conversation.append({"role": "assistant", "content": bot_msg})
 
-    last_user = history[-1][0]
+    last_user = pairs[-1][0]
     conversation.append({"role": "user", "content": last_user})
+    assistant_index = len(history_list) - 1
 
     model = get_model()
     injector = get_injector()
@@ -579,26 +655,37 @@ def concept_chat_reply(
 
     response = ""
     try:
-        with MODEL_LOCK:
-            if record and intensity > 0:
-                injector.enable(record, intensity)
-            for token in model.generate(
-                history=conversation,
-                max_tokens=512,
-                temperature=float(temperature),
-                top_k=int(top_k),
-            ):
-                response += token
-            history[-1] = (last_user, response)
+        with model_session():
+            try:
+                if record and intensity > 0:
+                    injector.enable(record, intensity)
+                for token in model.generate(
+                    history=conversation,
+                    max_tokens=512,
+                    temperature=float(temperature),
+                    top_k=int(top_k),
+                ):
+                    response += token
+                    history_list[assistant_index]["content"] = response
+                    yield history_list
+            finally:
+                injector.disable()
+    except ModelBusyError:
+        history_list[assistant_index]["content"] = (
+            "Model is busy with another request. Try again in a moment."
+        )
+        yield history_list
+        return
     except Exception as exc:
-        history[-1] = (last_user, f"[concept chat error] {exc}")
-    finally:
-        injector.disable()
+        history_list[assistant_index]["content"] = f"[concept chat error] {exc}"
+        yield history_list
+        return
 
-    return history
+    if response == "":
+        yield history_list
 
 
-def clear_history() -> List[tuple[str, str]]:
+def clear_history() -> List[dict]:
     return []
 
 
@@ -624,7 +711,7 @@ def build_interface() -> gr.Blocks:
                 )
                 prompt_variations = gr.Slider(
                     minimum=1,
-                    maximum=len(DEFAULT_PROMPT_TEMPLATES),
+                    maximum=len(SIMPLE_PROMPT_TEMPLATES),
                     value=3,
                     step=1,
                     label="Prompt variations per concept",
@@ -661,7 +748,7 @@ def build_interface() -> gr.Blocks:
             chatbot = gr.Chatbot(
                 label="Concept-aware chat",
                 height=420,
-                bubble_full_width=False,
+                type="messages",
             )
             user_box = gr.Textbox(
                 label="Your message",
@@ -768,7 +855,7 @@ def build_interface() -> gr.Blocks:
 
         clear_btn.click(clear_history, outputs=[chatbot])
 
-    demo.queue(concurrency_count=1)
+    demo.queue()
     return demo
 
 
@@ -777,4 +864,4 @@ demo = build_interface()
 
 if __name__ == "__main__":
     print("Launching Nanochat Concept Lab on http://localhost:7861 ...")
-    demo.launch(server_name="0.0.0.0", server_port=7861)
+    demo.launch(server_name="0.0.0.0", server_port=7861, share=True)
